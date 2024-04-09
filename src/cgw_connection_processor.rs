@@ -1,17 +1,24 @@
-use crate::cgw_connection_server::{CGWConnectionServer, CGWConnectionServerReqMsg};
+use crate::{
+    cgw_connection_server::{CGWConnectionServer, CGWConnectionServerReqMsg},
+    cgw_device::{cgw_detect_device_chages, CGWDevice, CGWDeviceCapabilities, OldNew},
+    cgw_devices_cache::CGWDevicesCache,
+    cgw_events::*,
+};
 
-use eui48::{MacAddress, Eui48};
+use eui48::MacAddress;
 
 use futures_util::{
     stream::{SplitSink, SplitStream},
     FutureExt, SinkExt, StreamExt,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{net::SocketAddr, sync::Arc, str::FromStr};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::{
     net::TcpStream,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver},
+        RwLock,
+    },
     time::{sleep, Duration, Instant},
 };
 use tokio_native_tls::TlsStream;
@@ -39,43 +46,7 @@ enum CGWConnectionState {
     ClosedGracefully,
 }
 
-#[derive(Debug, Default)]
-struct CGWEventLog {
-    serial: String,
-    log: String,
-    severity: i64,
-}
-
-#[derive(Debug, Default)]
-struct CGWEventConnectParamsCaps {
-    compatible: String,
-    model: String,
-    platform: String,
-    label_macaddr: String,
-}
-
-#[derive(Debug, Default)]
-struct CGWEventConnect {
-    serial: String,
-    firmware: String,
-    uuid: u64,
-    capabilities: CGWEventConnectParamsCaps,
-}
-
-#[derive(Debug)]
-enum CGWEventType {
-    Connect(CGWEventConnect),
-    Log(CGWEventLog),
-    Empty,
-}
-
-#[derive(Debug)]
-struct CGWEvent {
-    serial: String,
-    evt_type: CGWEventType,
-}
-
-fn cgw_parse_jrpc_event(map: &Map<String, Value>, method: &str) -> CGWEvent {
+pub fn cgw_parse_jrpc_event(map: &Map<String, Value>, method: &str) -> CGWEvent {
     if method == "log" {
         let params = map.get("params").expect("Params are missing");
         let mac_serial = MacAddress::from_str(params["serial"].as_str().unwrap()).unwrap();
@@ -85,12 +56,13 @@ fn cgw_parse_jrpc_event(map: &Map<String, Value>, method: &str) -> CGWEvent {
                 serial: mac_serial.to_hex_string().to_uppercase(),
                 log: params["log"].to_string(),
                 severity: serde_json::from_value(params["severity"].clone()).unwrap(),
-            })
+            }),
         };
     } else if method == "connect" {
         let params = map.get("params").expect("Params are missing");
         let mac_serial = MacAddress::from_str(params["serial"].as_str().unwrap()).unwrap();
-        let label = MacAddress::from_str(params["capabilities"]["label_macaddr"].as_str().unwrap()).unwrap();
+        let label = MacAddress::from_str(params["capabilities"]["label_macaddr"].as_str().unwrap())
+            .unwrap();
         return CGWEvent {
             serial: mac_serial.to_hex_string().to_uppercase(),
             evt_type: CGWEventType::Connect(CGWEventConnect {
@@ -145,10 +117,7 @@ async fn cgw_parse_jrpc_message(message: Message) -> Result<CGWEvent, &'static s
 
         match &event.evt_type {
             CGWEventType::Log(l) => {
-                debug!(
-                    "Received LOG evt from device {}: {}",
-                    l.serial, l.log
-                );
+                debug!("Received LOG evt from device {}: {}", l.serial, l.log);
             }
             CGWEventType::Connect(c) => {
                 debug!(
@@ -172,20 +141,54 @@ async fn cgw_parse_jrpc_message(message: Message) -> Result<CGWEvent, &'static s
     Err("Failed to parse event/method")
 }
 
+fn cgw_create_device_update_msg_to_nb(mac: &String, group_id: i32, diff: &HashMap<String, OldNew>) -> String {
+    let mut vec_changes: Vec<CGWDeviceChange> = Vec::new();
+
+    for (name, values) in diff.iter() {
+        vec_changes.push(CGWDeviceChange {
+                changed: name.clone(),
+                old: values.old_value.clone(),
+                new:values.new_value.clone()
+            }
+        );
+    }
+
+    let msg_str = CGWEvent {
+        serial: group_id.to_string(),
+        evt_type: CGWEventType::DeviceChange(CGWEventDeviceChange {
+            event_type: "infrastructure_device_capabilities_changed".to_string(),
+            infra_group_id: group_id.to_string(),
+            infra_group_infra_device: mac.clone(),
+            changes: vec_changes
+        })
+    };
+
+    let msg_str = serde_json::to_string(&msg_str).unwrap();
+
+    msg_str
+}
+
 pub struct CGWConnectionProcessor {
     cgw_server: Arc<CGWConnectionServer>,
     pub serial: Option<String>,
     pub addr: SocketAddr,
     pub idx: i64,
+    devices_cache: Arc<RwLock<CGWDevicesCache>>,
 }
 
 impl CGWConnectionProcessor {
-    pub fn new(server: Arc<CGWConnectionServer>, conn_idx: i64, addr: SocketAddr) -> Self {
+    pub fn new(
+        server: Arc<CGWConnectionServer>,
+        conn_idx: i64,
+        addr: SocketAddr,
+        cache: Arc<RwLock<CGWDevicesCache>>,
+    ) -> Self {
         let conn_processor: CGWConnectionProcessor = CGWConnectionProcessor {
             cgw_server: server,
             serial: None,
             addr: addr,
             idx: conn_idx,
+            devices_cache: cache,
         };
 
         conn_processor
@@ -243,8 +246,49 @@ impl CGWConnectionProcessor {
         };
 
         match evt.evt_type {
-            CGWEventType::Connect(c) => (),
-            _ => warn!("Device {} is not abiding the protocol: first message - CONNECT - expected", evt.serial),
+            CGWEventType::Connect(c) => {
+                let caps = CGWDeviceCapabilities::new(
+                    c.capabilities.compatible,
+                    c.capabilities.model,
+                    c.capabilities.platform,
+                    c.capabilities.label_macaddr,
+                );
+
+                let device = self.devices_cache.write().await.get_device_from_cache(&evt.serial);
+                let changes = cgw_detect_device_chages(&device.unwrap(), &caps, &c.firmware, c.uuid);
+
+                match changes {
+                    Some(diff) => {
+                        let device = self.devices_cache.read().await.get_device_from_cache(&evt.serial).unwrap();
+                        let new_msg = cgw_create_device_update_msg_to_nb(&evt.serial, device.get_device_group_id(), &diff);
+
+                        debug!("CGW to NB msg: {}", new_msg.clone());
+
+                        self.cgw_server.enqueue_mbox_message_from_cgw_to_nb_api(device.get_device_group_id(), new_msg);
+                    }
+                    None => {
+                        debug!("Capabilities for device: {} was not changed!", evt.serial.clone())
+                    }
+                }
+
+                self.devices_cache
+                    .write()
+                    .await
+                    .update_device_from_cache_device_capabilities(&evt.serial, &caps);
+                self.devices_cache
+                    .write()
+                    .await
+                    .update_device_from_cache_device_firmware(&evt.serial, &c.firmware);
+                self.devices_cache
+                    .write()
+                    .await
+                    .update_device_from_cache_device_uuid(&evt.serial, c.uuid);
+
+            }
+            _ => warn!(
+                "Device {} is not abiding the protocol: first message - CONNECT - expected",
+                evt.serial
+            ),
         }
 
         self.serial = Some(evt.serial.clone());
@@ -264,7 +308,10 @@ impl CGWConnectionProcessor {
         if let Some(m) = ack {
             match m {
                 CGWConnectionProcessorReqMsg::AddNewConnectionAck => {
-                    debug!("websocket connection established: {} {}", self.addr, evt.serial);
+                    debug!(
+                        "websocket connection established: {} {}",
+                        self.addr, evt.serial
+                    );
                 }
                 _ => panic!("Unexpected response from server, expected ACK/NOT ACK)"),
             }

@@ -950,6 +950,7 @@ impl CGWConnectionServer {
         // Only ACK connection. We will either drop it or accept it once processor starts
         // (we'll handle it via "mailbox" notify handle in process_internal_mbox)
         let server_clone = self.clone();
+        let cache_clone = self.devices_cache.clone();
 
         self.wss_rx_tx_runtime.spawn(async move {
             // Accept the TLS connection.
@@ -960,7 +961,9 @@ impl CGWConnectionServer {
                     return;
                 }
             };
-            let conn_processor = CGWConnectionProcessor::new(server_clone, conn_idx, addr);
+
+            let conn_processor =
+                CGWConnectionProcessor::new(server_clone, conn_idx, addr, cache_clone);
             conn_processor.start(tls_stream).await;
         });
     }
@@ -968,6 +971,8 @@ impl CGWConnectionServer {
 
 #[cfg(test)]
 mod tests {
+    use crate::{cgw_connection_processor::cgw_parse_jrpc_event, cgw_events::{CGWEvent, CGWEventType}};
+
     use super::*;
 
     fn get_connect_json_msg() -> &'static str {
@@ -1009,10 +1014,10 @@ mod tests {
         let map: Map<String, Value> =
             serde_json::from_str(msg).expect("Failed to parse input json");
         let method = map["method"].as_str().unwrap();
-        let event: CGWEvent = cgw_parse_jrpc_event(&map, method.to_string());
+        let event: CGWEvent = cgw_parse_jrpc_event(&map, method);
 
-        match event {
-            CGWEvent::Connect(_) => {
+        match event.evt_type {
+            CGWEventType::Connect(_) => {
                 assert!(true);
             }
             _ => {
@@ -1028,10 +1033,10 @@ mod tests {
         let map: Map<String, Value> =
             serde_json::from_str(msg).expect("Failed to parse input json");
         let method = map["method"].as_str().unwrap();
-        let event: CGWEvent = cgw_parse_jrpc_event(&map, method.to_string());
+        let event: CGWEvent = cgw_parse_jrpc_event(&map, method);
 
-        match event {
-            CGWEvent::Log(_) => {
+        match event.evt_type {
+            CGWEventType::Log(_) => {
                 assert!(true);
             }
             _ => {
